@@ -10,7 +10,6 @@
 import logging
 import json
 
-from datetime import date
 from requests import Session
 
 from openerp import _, api, exceptions, fields, models, SUPERUSER_ID
@@ -111,6 +110,12 @@ class AccountInvoice(models.Model):
         string="SII Refund Type", default=_default_sii_refund_type,
         oldname='refund_type',
     )
+    sii_account_registration_date = fields.Date(
+        string='SII account registration date', readonly=True, copy=False,
+        help="Indicates the account registration date set at the SII, which "
+             "must be the date when the invoice is recorded in the system and "
+             "is independent of the date of the accounting entry of the "
+             "invoice")
     sii_registration_key = fields.Many2one(
         comodel_name='aeat.sii.mapping.registration.keys',
         string="SII registration key", default=_default_sii_registration_key,
@@ -511,9 +516,11 @@ class AccountInvoice(models.Model):
         self.ensure_one()
         taxes_dict = {}
         taxes_f = {}
+        taxes_fa = {}
         taxes_isp = {}
         taxes_ns = {}
         taxes_sfrs = self._get_sii_taxes_map(['SFRS'])
+        taxes_sfrsa = self._get_sii_taxes_map(['SFRSA'])
         taxes_sfrisp = self._get_sii_taxes_map(['SFRISP'])
         taxes_sfrns = self._get_sii_taxes_map(['SFRNS'])
         tax_amount = 0.0
@@ -529,7 +536,8 @@ class AccountInvoice(models.Model):
                     taxes_ns.setdefault('no_sujeto', {'BaseImponible': 0},)
                     taxes_ns['no_sujeto']['BaseImponible'] += inv_line.\
                         _get_sii_line_price_subtotal()
-
+                elif tax_line in taxes_sfrsa:
+                    inv_line._update_sii_tax_line(taxes_fa, tax_line)
         if taxes_isp:
             taxes_dict.setdefault(
                 'InversionSujetoPasivo', {'DetalleIVA': taxes_isp.values()},
@@ -539,7 +547,7 @@ class AccountInvoice(models.Model):
                 'DesgloseIVA', {'DetalleIVA': (taxes_f.values() +
                                                taxes_ns.values())},
             )
-        for val in taxes_isp.values() + taxes_f.values():
+        for val in taxes_isp.values() + taxes_f.values() + taxes_fa.values():
             val['CuotaSoportada'] = float_round(
                 val['CuotaSoportada'] * sign, 2,
             )
@@ -551,6 +559,18 @@ class AccountInvoice(models.Model):
             tax_amount += val['CuotaSoportada']
         for reg in taxes_ns.values():
             reg['BaseImponible'] = float_round(reg['BaseImponible'] * sign, 2)
+        if taxes_fa:
+            # Régimen especial agricultura - Cambiar claves
+            for tax_fa in taxes_fa.values():
+                tax_fa['PorcentCompensacionREAGYP'] = tax_fa.pop(
+                    'TipoImpositivo'
+                )
+                tax_fa['ImporteCompensacionREAGYP'] = tax_fa.pop(
+                    'CuotaSoportada'
+                )
+            taxes_dict.setdefault(
+                'DesgloseIVA', {'DetalleIVA': taxes_fa.values()},
+            )
         return taxes_dict, tax_amount
 
     @api.multi
@@ -594,9 +614,11 @@ class AccountInvoice(models.Model):
         of each supplier invoice. The SII recommends to set the send date as
         the default value (point 9.3 of the document
         SII_Descripcion_ServicioWeb_v0.7.pdf), so by default we return
-        the current date
+        the current date or, if exists, the stored
+        sii_account_registration_date
         :return String date in the format %Y-%m-%d"""
-        return date.today().strftime("%Y-%m-%d")
+        self.ensure_one()
+        return self.sii_account_registration_date or fields.Date.today()
 
     @api.multi
     def _get_sii_invoice_dict_out(self, cancel=False):
@@ -916,6 +938,12 @@ class AccountInvoice(models.Model):
                     })
                 else:
                     inv_vals['sii_send_failed'] = True
+                if ('sii_state' in inv_vals and
+                        not invoice.sii_account_registration_date and
+                        invoice.type[:2] == 'in'):
+                    inv_vals['sii_account_registration_date'] = (
+                        self._get_account_registration_date()
+                    )
                 inv_vals['sii_return'] = res
                 send_error = False
                 if res_line['CodigoErrorRegistro']:
